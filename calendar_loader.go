@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -26,6 +27,10 @@ func loadICSFromReader(reader io.Reader, calendarName string, color lipgloss.Col
 	}
 
 	var events []Event
+	now := time.Now()
+	// Expand recurring events up to 1 year in the future
+	maxDate := now.AddDate(1, 0, 0)
+
 	for _, event := range cal.Events() {
 		start, err := event.GetStartAt()
 		if err != nil {
@@ -56,15 +61,58 @@ func loadICSFromReader(reader io.Reader, calendarName string, color lipgloss.Col
 			summary = "(No title)"
 		}
 
-		events = append(events, Event{
-			Summary:       summary,
-			Start:         start,
-			End:           end,
-			Description:   description,
-			CalendarName:  calendarName,
-			CalendarColor: color,
-			UID:           uid,
-		})
+		// Check for RRULE (recurrence rule) - try multiple property access methods
+		var rruleValue string
+		
+		// First, try accessing all properties to find RRULE (most reliable)
+		for _, prop := range event.Properties {
+			// IANAToken is a field, not a method
+			if strings.ToUpper(prop.IANAToken) == "RRULE" {
+				rruleValue = prop.Value
+				break
+			}
+		}
+		
+		// If not found in Properties, try GetProperty with extended
+		if rruleValue == "" {
+			rruleProp := event.GetProperty(ics.ComponentPropertyExtended("RRULE"))
+			if rruleProp != nil {
+				rruleValue = rruleProp.Value
+			} else {
+				// Try with lowercase
+				rruleProp = event.GetProperty(ics.ComponentPropertyExtended("rrule"))
+				if rruleProp != nil {
+					rruleValue = rruleProp.Value
+				}
+			}
+		}
+
+		if rruleValue != "" {
+			// Parse RRULE and expand occurrences
+			occurrences := expandRecurringEvent(start, end, rruleValue, maxDate, now)
+			for _, occ := range occurrences {
+				events = append(events, Event{
+					Summary:       summary,
+					Start:         occ.Start,
+					End:           occ.End,
+					Description:   description,
+					CalendarName:  calendarName,
+					CalendarColor: color,
+					UID:           uid,
+				})
+			}
+		} else {
+			// Single event (non-recurring) - include even if in the past (for today's view)
+			events = append(events, Event{
+				Summary:       summary,
+				Start:         start,
+				End:           end,
+				Description:   description,
+				CalendarName:  calendarName,
+				CalendarColor: color,
+				UID:           uid,
+			})
+		}
 	}
 
 	return events, nil
@@ -622,4 +670,199 @@ func renderNextEvent(event *Event) string {
 		Width(60)
 
 	return "\n" + titleStyle.Foreground(lipgloss.Color("86")).Bold(true).Render("📅 Next Event") + "\n\n" + boxStyle.Render(boxContent.String())
+}
+
+// expandRecurringEvent expands a recurring event based on RRULE
+type occurrence struct {
+	Start time.Time
+	End   time.Time
+}
+
+func expandRecurringEvent(start, end time.Time, rrule string, maxDate time.Time, now time.Time) []occurrence {
+	var occurrences []occurrence
+	duration := end.Sub(start)
+
+	// Parse RRULE - basic support for common patterns
+	// Format: FREQ=DAILY|WEEKLY|MONTHLY|YEARLY[;INTERVAL=n][;COUNT=n][;UNTIL=YYYYMMDDTHHMMSSZ]
+	rrule = strings.ToUpper(rrule)
+	
+	var freq string
+	interval := 1
+	var until time.Time
+	count := -1
+
+	parts := strings.Split(rrule, ";")
+	for _, part := range parts {
+		part = strings.TrimSpace(part)
+		if strings.HasPrefix(part, "FREQ=") {
+			freq = strings.TrimPrefix(part, "FREQ=")
+		} else if strings.HasPrefix(part, "INTERVAL=") {
+			if val, err := strconv.Atoi(strings.TrimPrefix(part, "INTERVAL=")); err == nil {
+				interval = val
+			}
+		} else if strings.HasPrefix(part, "UNTIL=") {
+			untilStr := strings.TrimPrefix(part, "UNTIL=")
+			// Try parsing different date formats
+			if t, err := time.Parse("20060102T150405Z", untilStr); err == nil {
+				until = t
+			} else if t, err := time.Parse("20060102T150405", untilStr); err == nil {
+				until = t
+			} else if t, err := time.Parse("20060102", untilStr); err == nil {
+				until = t
+			}
+		} else if strings.HasPrefix(part, "COUNT=") {
+			if val, err := strconv.Atoi(strings.TrimPrefix(part, "COUNT=")); err == nil {
+				count = val
+			}
+		}
+	}
+
+	// Determine end date
+	endDate := maxDate
+	if !until.IsZero() && until.Before(maxDate) {
+		endDate = until
+	}
+
+	// Start from the original start date
+	currentStart := start
+	iteration := 0
+	maxIterations := 1000 // Safety limit
+
+	// Check if we need to fast-forward past occurrences
+	// Only fast-forward if the event is more than 1 day in the past
+	// We want to include events from yesterday (they're still relevant)
+	originalIsToday := currentStart.Format("2006-01-02") == now.Format("2006-01-02")
+	yesterday := now.AddDate(0, 0, -1)
+	originalIsYesterday := currentStart.Format("2006-01-02") == yesterday.Format("2006-01-02")
+	// Only fast-forward if it's before yesterday (more than 1 day old)
+	needsFastForward := currentStart.Before(yesterday) && !originalIsToday && !originalIsYesterday
+	
+	// If the original event is today or in the future, we'll include it in the loop
+	// If it's in the past (not today), we need to fast-forward to today or the next occurrence
+	if needsFastForward {
+		// For past events, fast-forward to today's occurrence (if it exists) or the next occurrence after now
+		// We want to include today's occurrence even if the event started in the past
+		todayDate := now.Format("2006-01-02")
+		switch freq {
+		case "DAILY":
+			// Fast-forward until we reach today (date-wise) or the future
+			for {
+				nextStart := currentStart.AddDate(0, 0, interval)
+				nextDate := nextStart.Format("2006-01-02")
+				
+				// Stop if we've reached today (same date) - regardless of time
+				// OR if we've reached the future
+				if nextDate == todayDate {
+					currentStart = nextStart
+					break
+				}
+				
+				// If we've reached the future (after today), stop
+				if nextStart.After(now) {
+					currentStart = nextStart
+					break
+				}
+				
+				// If still in the past (before today), continue
+				currentStart = nextStart
+			}
+		case "WEEKLY":
+			// Fast-forward until we reach today (date-wise) or the future
+			for {
+				nextStart := currentStart.AddDate(0, 0, 7*interval)
+				nextDate := nextStart.Format("2006-01-02")
+				if nextDate == todayDate {
+					currentStart = nextStart
+					break
+				}
+				if nextStart.After(now) {
+					currentStart = nextStart
+					break
+				}
+				currentStart = nextStart
+			}
+		case "MONTHLY":
+			// Fast-forward until we reach today (date-wise) or the future
+			for {
+				nextStart := currentStart.AddDate(0, interval, 0)
+				nextDate := nextStart.Format("2006-01-02")
+				if nextDate == todayDate {
+					currentStart = nextStart
+					break
+				}
+				if nextStart.After(now) {
+					currentStart = nextStart
+					break
+				}
+				currentStart = nextStart
+			}
+		case "YEARLY":
+			// Fast-forward until we reach today (date-wise) or the future
+			for {
+				nextStart := currentStart.AddDate(interval, 0, 0)
+				nextDate := nextStart.Format("2006-01-02")
+				if nextDate == todayDate {
+					currentStart = nextStart
+					break
+				}
+				if nextStart.After(now) {
+					currentStart = nextStart
+					break
+				}
+				currentStart = nextStart
+			}
+		default:
+			// Unknown frequency, return empty
+			return occurrences
+		}
+		// Make sure we don't skip too far
+		if currentStart.After(endDate) {
+			return occurrences
+		}
+	} else {
+		// Original event is today or in the future - start from the original start
+		// This ensures we include the first occurrence
+		currentStart = start
+	}
+
+	// Generate occurrences starting from currentStart
+	// Always include the first occurrence if it's today or in the future
+	for currentStart.Before(endDate) && iteration < maxIterations {
+		if count > 0 && iteration >= count {
+			break
+		}
+
+		// Include occurrences that are yesterday, today, or in the future
+		// We include yesterday's events because they're still relevant (just happened)
+		occIsToday := currentStart.Format("2006-01-02") == now.Format("2006-01-02")
+		occIsYesterday := currentStart.Format("2006-01-02") == yesterday.Format("2006-01-02")
+		occIsFuture := currentStart.After(now)
+		
+		// Always include if it's yesterday, today, or in the future
+		if occIsYesterday || occIsToday || occIsFuture {
+			occurrences = append(occurrences, occurrence{
+				Start: currentStart,
+				End:   currentStart.Add(duration),
+			})
+		}
+
+		// Move to next occurrence based on frequency
+		switch freq {
+		case "DAILY":
+			currentStart = currentStart.AddDate(0, 0, interval)
+		case "WEEKLY":
+			currentStart = currentStart.AddDate(0, 0, 7*interval)
+		case "MONTHLY":
+			currentStart = currentStart.AddDate(0, interval, 0)
+		case "YEARLY":
+			currentStart = currentStart.AddDate(interval, 0, 0)
+		default:
+			// Unknown frequency, stop expansion
+			return occurrences
+		}
+
+		iteration++
+	}
+
+	return occurrences
 }
