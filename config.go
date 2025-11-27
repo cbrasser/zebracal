@@ -13,7 +13,7 @@ func getConfigDir() (string, error) {
 	if err != nil {
 		return "", err
 	}
-	configDir := filepath.Join(usr.HomeDir, ".config", "zebrascal")
+	configDir := filepath.Join(usr.HomeDir, ".config", "cbracal")
 	return configDir, nil
 }
 
